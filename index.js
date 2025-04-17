@@ -3,58 +3,43 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const admin = require('firebase-admin');
 require('dotenv').config();
+
+// Decode service account from Base64
 const base64 = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 const jsonString = Buffer.from(base64, 'base64').toString('utf8');
 const serviceAccount = JSON.parse(jsonString);
-// const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-const { WebSocketServer } = require('ws');
-const http = require('http');
 
+// Initialize Firebase
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: 'https://taptodine-649b0-default-rtdb.firebaseio.com' // 🔁 replace with your Realtime DB URL
 });
 
 const db = admin.firestore();
+const rtdb = admin.database();
 const app = express();
 const PORT = 5000;
-
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
 
 app.use(cors());
 app.use(bodyParser.json());
 
-// Store active WebSocket connections mapped by restaurantId
-const clients = new Map(); // { restaurantId: Set<WebSocket> }
-
-// Broadcast updated orders to all connected clients for a given restaurantId
-function broadcastOrders(restaurantId) {
-  db.collection('orders')
+// Utility: push updated orders to Realtime Database
+const pushLiveOrders = async (restaurantId) => {
+  const snapshot = await db.collection('orders')
     .where('restaurantId', '==', restaurantId)
     .orderBy('createdAt', 'desc')
-    .get()
-    .then(snapshot => {
-      const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      const receivers = clients.get(restaurantId);
-      if (receivers) {
-        const msg = JSON.stringify(orders);
-        receivers.forEach(ws => {
-          if (ws.readyState === 1) ws.send(msg); // Ensure WebSocket is open before sending
-        });
-      }
-    })
-    .catch(err => {
-      console.error('Error fetching orders: ', err);
-    });
-}
+    .get();
 
-// Routes
+  const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+  await rtdb.ref(`liveOrders/${restaurantId}`).set(orders);
+};
 
-// GET menu items by restaurantId
+// Get menu by restaurantId
 app.get('/menu/:restaurantId', async (req, res) => {
   try {
-    const { restaurantId } = req.params;
-    const snapshot = await db.collection('menuItems').where('restaurantId', '==', restaurantId).get();
+    const snapshot = await db.collection('menuItems')
+      .where('restaurantId', '==', req.params.restaurantId)
+      .get();
     const items = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     res.status(200).json(items);
   } catch (err) {
@@ -62,57 +47,30 @@ app.get('/menu/:restaurantId', async (req, res) => {
   }
 });
 
-// POST new order (with qty)
-app.post('/order', async (req, res) => {
+app.put('/orders/fulfilled/:restaurantId/:orderId', async (req, res) => {
   try {
-    const orderData = req.body;
+    const { restaurantId, orderId } = req.params;
+    
+    // Update order status to 'fulfilled' in Realtime Database
+    await rtdb.ref(`orders/${restaurantId}/${orderId}`).update({
+      status: 'fulfilled',
+    });
 
-    if (!orderData.items || orderData.items.length === 0) {
-      return res.status(400).send('Order must have at least one item');
-    }
+    // Optionally, push live orders after update (e.g., syncing data elsewhere)
+    await pushLiveOrders(restaurantId);
 
-    // Calculate total price for each item based on qty and price
-    const updatedItems = orderData.items.map(item => ({
-      name: item.name,
-      price: item.price,
-      qty: item.qty,
-      totalPrice: item.price * item.qty, // Calculate total price for each item
-    }));
-
-    orderData.items = updatedItems;
-    orderData.createdAt = admin.firestore.FieldValue.serverTimestamp();
-
-    // Save order to Firestore
-    await db.collection('orders').add(orderData);
-
-    // Broadcast the updated orders to all connected clients
-    broadcastOrders(orderData.restaurantId);
-
-    res.status(201).send('Order placed successfully');
+    res.status(200).send('Order marked as fulfilled');
   } catch (err) {
-    res.status(500).send('Error placing order: ' + err.message);
+    res.status(500).send('Error: ' + err.message);
   }
 });
 
-// GET orders for a restaurant
-app.get('/orders/:restaurantId', async (req, res) => {
-  try {
-    const { restaurantId } = req.params;
-    const snapshot = await db.collection('orders').where('restaurantId', '==', restaurantId).orderBy('createdAt', 'desc').get();
-    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-    res.status(200).json(orders);
-  } catch (err) {
-    res.status(500).send('Error fetching orders: ' + err.message);
-  }
-});
-
-// POST add menu item
+// Add menu item
 app.post('/menu/add', async (req, res) => {
   try {
     const { name, price, restaurantId } = req.body;
-
     if (!name || !price || !restaurantId) {
-      return res.status(400).send('Missing name, price or restaurantId');
+      return res.status(400).send('Missing fields');
     }
 
     const newItem = {
@@ -125,46 +83,118 @@ app.post('/menu/add', async (req, res) => {
     const docRef = await db.collection('menuItems').add(newItem);
     res.status(201).send({ id: docRef.id, message: 'Menu item added' });
   } catch (err) {
-    res.status(500).send('Error adding menu item: ' + err.message);
+    res.status(500).send('Error: ' + err.message);
   }
 });
 
-// PUT update menu item
+// Update menu item
 app.put('/menu/:id', async (req, res) => {
   try {
-    const { id } = req.params;
     const { name, price } = req.body;
-    await db.collection('menuItems').doc(id).update({ name, price });
+    await db.collection('menuItems').doc(req.params.id).update({ name, price });
     res.status(200).send('Menu item updated');
   } catch (err) {
-    res.status(500).send('Error updating item: ' + err.message);
+    res.status(500).send('Error: ' + err.message);
   }
 });
 
-// DELETE menu item
+// Delete menu item
 app.delete('/menu/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    await db.collection('menuItems').doc(id).delete();
+    await db.collection('menuItems').doc(req.params.id).delete();
     res.status(200).send('Menu item deleted');
   } catch (err) {
-    res.status(500).send('Error deleting item: ' + err.message);
+    res.status(500).send('Error: ' + err.message);
   }
 });
 
-// POST register
+// Place an order
+app.post('/order', async (req, res) => {
+  try {
+    const order = req.body;
+    if (!order.items?.length || !order.restaurantId) {
+      return res.status(400).send('Invalid order');
+    }
+
+    const items = order.items.map(item => ({
+      name: item.name,
+      price: item.price,
+      qty: item.qty,
+      totalPrice: item.price * item.qty
+    }));
+
+    const orderData = {
+      ...order,
+      items,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    await db.collection('orders').add(orderData);
+
+    // Update Realtime DB for live dashboard
+    await pushLiveOrders(order.restaurantId);
+
+    res.status(201).send('Order placed');
+  } catch (err) {
+    res.status(500).send('Error placing order: ' + err.message);
+  }
+});
+
+// Get orders for a restaurant
+app.get('/orders/:restaurantId', async (req, res) => {
+  try {
+    const snapshot = await db.collection('orders')
+      .where('restaurantId', '==', req.params.restaurantId)
+      .orderBy('createdAt', 'desc')
+      .get();
+
+    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.status(200).json(orders);
+  } catch (err) {
+    res.status(500).send('Error fetching orders: ' + err.message);
+  }
+});
+
+// Fulfill order
+// app.put('/orders/fulfilled/:orderId', async (req, res) => {
+//   try {
+//     await db.collection('orders').doc(req.params.orderId).update({ status: 'fulfilled' });
+
+//     const orderDoc = await db.collection('orders').doc(req.params.orderId).get();
+//     const restaurantId = orderDoc.data().restaurantId;
+//     await pushLiveOrders(restaurantId);
+
+//     res.status(200).send('Order marked fulfilled');
+//   } catch (err) {
+//     res.status(500).send('Error: ' + err.message);
+//   }
+// });
+
+
+
+
+
+// Delete order
+app.delete('/orders/:orderId', async (req, res) => {
+  try {
+    const orderRef = db.collection('orders').doc(req.params.orderId);
+    const order = await orderRef.get();
+    const restaurantId = order.data().restaurantId;
+
+    await orderRef.delete();
+    await pushLiveOrders(restaurantId);
+
+    res.status(200).send('Order deleted');
+  } catch (err) {
+    res.status(500).send('Error: ' + err.message);
+  }
+});
+
+// Register restaurant
 app.post('/register', async (req, res) => {
   try {
     const { email, password, restaurantName } = req.body;
-
-    if (!email || !password || !restaurantName) {
-      return res.status(400).send('Missing email, password, or restaurantName');
-    }
-
-    const userRecord = await admin.auth().createUser({
-      email,
-      password,
-    });
+    const userRecord = await admin.auth().createUser({ email, password });
 
     const newRestaurant = {
       uid: userRecord.uid,
@@ -174,73 +204,46 @@ app.post('/register', async (req, res) => {
     };
 
     await db.collection('restaurants').doc(userRecord.uid).set(newRestaurant);
-    res.status(201).send({ message: 'Registered successfully', restaurantId: userRecord.uid });
+
+    res.status(201).send({ message: 'Registered', restaurantId: userRecord.uid });
   } catch (err) {
-    res.status(500).send('Error registering user: ' + err.message);
+    res.status(500).send('Registration error: ' + err.message);
   }
 });
 
-// POST login
+// Login restaurant
 app.post('/login', async (req, res) => {
   try {
     const { email } = req.body;
-    const usersSnapshot = await db.collection('restaurants').where('email', '==', email).get();
-    if (usersSnapshot.empty) {
-      return res.status(404).send('User not found');
-    }
-    const userData = usersSnapshot.docs[0].data();
-    res.status(200).send({ message: 'Login successful', restaurantId: userData.uid, restaurantName: userData.restaurantName });
+    const snapshot = await db.collection('restaurants').where('email', '==', email).get();
+
+    if (snapshot.empty) return res.status(404).send('User not found');
+
+    const user = snapshot.docs[0].data();
+    res.status(200).send({ message: 'Login success', restaurantId: user.uid, restaurantName: user.restaurantName });
   } catch (err) {
-    res.status(500).send('Login failed: ' + err.message);
+    res.status(500).send('Login error: ' + err.message);
   }
 });
 
-// PUT update order status to fulfilled
-app.put('/orders/fulfilled/:orderId', async (req, res) => {
+
+
+app.get('/name/:restaurantId', async (req, res) => {
   try {
-    const { orderId } = req.params;
-    await db.collection('orders').doc(orderId).update({
-      status: 'fulfilled',
-    });
-    res.status(200).send('Order marked as fulfilled');
+    const restaurantId = req.params.restaurantId;
+    const doc = await db.collection('restaurants').doc(restaurantId).get();
+
+    if (!doc.exists) return res.status(404).send('Restaurant not found');
+
+    const user = doc.data();
+    res.status(200).send({ message: 'success', restaurantName: user.restaurantName });
   } catch (err) {
-    res.status(500).send('Error updating order status: ' + err.message);
+    res.status(500).send('Name error: ' + err.message);
   }
 });
 
-// DELETE an order
-app.delete('/orders/:orderId', async (req, res) => {
-  try {
-    const { orderId } = req.params;
-    await db.collection('orders').doc(orderId).delete();
-    res.status(200).send('Order deleted');
-  } catch (err) {
-    res.status(500).send('Error deleting order: ' + err.message);
-  }
-});
 
-// WebSocket logic to manage connections per restaurant
-wss.on('connection', (ws, req) => {
-  const restaurantId = req.url.split("/").pop();
-  if (!restaurantId) return ws.close();
-
-  if (!clients.has(restaurantId)) {
-    clients.set(restaurantId, new Set());
-  }
-  clients.get(restaurantId).add(ws);
-
-  ws.on('close', () => {
-    clients.get(restaurantId)?.delete(ws);
-    if (clients.get(restaurantId)?.size === 0) {
-      clients.delete(restaurantId);
-    }
-  });
-
-  // Initial push to WebSocket client with orders for restaurant
-  broadcastOrders(restaurantId);
-});
-
-// Start the server
-server.listen(PORT, () => {
-  console.log(`TapToDine backend running on http://localhost:${PORT}`);
+// Start server
+app.listen(PORT, () => {
+  console.log(`TapToDine backend running at http://localhost:${PORT}`);
 });
